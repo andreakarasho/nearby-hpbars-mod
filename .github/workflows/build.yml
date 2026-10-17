@@ -1,0 +1,74 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# The tag build publishes a Release with the zip the mod registry downloads.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Build (LTO, stripped)
+        run: make build OUT=dist/nearby-hpbars
+
+      - name: Package
+        id: package
+        run: |
+          # On a tag, stamp mod.json with the tag's version (the registry entry,
+          # mod.json and the tag all have to agree, and the registry wants a bare
+          # MAJOR.MINOR.PATCH).
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF" != "${GITHUB_REF#refs/tags/}" ]; then
+            python3 -c "import json,sys;p='dist/nearby-hpbars/mod.json';m=json.load(open(p));m['version']=sys.argv[1];json.dump(m,open(p,'w'),indent=2)" "$version"
+          fi
+          cd dist/nearby-hpbars
+          zip -r ../../nearby-hpbars.zip mod.json mod.wasm
+          cd ../..
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum nearby-hpbars.zip | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          ls -l nearby-hpbars.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nearby-hpbars
+          path: nearby-hpbars.zip
+
+      # A tag publishes the zip the mod registry downloads. The release body
+      # carries the sha256 the registry entry has to match
+      # (github.com/ClassicUO/classicuo-mods -> mods/nearby-hpbars.json).
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: nearby-hpbars.zip
+          body: |
+            `nearby-hpbars.zip` sha256: `${{ steps.package.outputs.sha256 }}`
+
+            Registry entry (`mods/nearby-hpbars.json` in ClassicUO/classicuo-mods):
+
+            ```json
+            {
+              "name": "nearby-hpbars",
+              "version": "${{ steps.package.outputs.version }}",
+              "abi": "4",
+              "description": "Nearby mobiles health list with configurable quick heal/cure buttons",
+              "authors": ["andreakarasho"],
+              "repository": "https://github.com/andreakarasho/nearby-hpbars-mod",
+              "license": "BSD-2-Clause",
+              "download": "https://github.com/andreakarasho/nearby-hpbars-mod/releases/download/${{ github.ref_name }}/nearby-hpbars.zip",
+              "sha256": "${{ steps.package.outputs.sha256 }}"
+            }
+            ```
