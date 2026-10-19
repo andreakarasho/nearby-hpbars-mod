@@ -17,7 +17,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 [[package]]
 name = "cuo-mod-sdk"
 version = "0.4.0"
-source = "git+https://github.com/ClassicUO/classicuo-mods-sdk?rev=d4c9e10#d4c9e106d9e093ab4d339814f163cd01c9d81401"
+source = "git+https://github.com/ClassicUO/classicuo-mods-sdk?rev=8f2adac#8f2adac1f01c0f2d14692612679c1afda198eb41"
 dependencies = [
  "cuo-mod-sdk-macros",
  "serde",
@@ -28,7 +28,7 @@ dependencies = [
 [[package]]
 name = "cuo-mod-sdk-macros"
 version = "0.4.0"
-source = "git+https://github.com/ClassicUO/classicuo-mods-sdk?rev=d4c9e10#d4c9e106d9e093ab4d339814f163cd01c9d81401"
+source = "git+https://github.com/ClassicUO/classicuo-mods-sdk?rev=8f2adac#8f2adac1f01c0f2d14692612679c1afda198eb41"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "cuo-nearby-hpbars"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cuo-mod-sdk",
  "serde",

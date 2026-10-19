@@ -512,11 +512,11 @@ fn quick_color(slot: usize) -> Color {
 fn on_click(
     click: On<Event, UiClick>,
     names: Query<&UiName>,
-    mouse: Res<MouseInputDto>,
+    mouse: Res<MouseInput>,
     targeting: Option<Res<TargetingState>>,
     war_mode: Query<&ServerFlags, With<Player>>,
     items: Query<(&Serial, &Graphic, &ChildOf)>,
-    player: Query<&EquipmentSlotsDto, With<Player>>,
+    player: Query<&EquipmentSlots, With<Player>>,
 ) {
     let Some(name) = names.get(click.entity()) else {
         return;
@@ -601,7 +601,7 @@ fn on_click(
 /// A bandage anywhere inside the backpack, including nested bags.
 fn find_bandage(
     items: &Query<(&Serial, &Graphic, &ChildOf)>,
-    player: &Query<&EquipmentSlotsDto, With<Player>>,
+    player: &Query<&EquipmentSlots, With<Player>>,
 ) -> Option<u32> {
     let (_, equipment) = player.single()?;
     let backpack = *equipment.serials.get(BACKPACK_LAYER)?;
@@ -778,7 +778,7 @@ fn spawn_window(cmds: &mut Commands, settings: &Settings) -> Window {
     ));
     cmds.spawn((
         Node { width: Val::px(bw), height: Val::px(bh), ..Node::base() },
-        UiCustomDto { kind: 0, asset_id: OPTIONS_GUMP, hue_z: 1.0, ..Default::default() },
+        UiCustom { kind: 0, asset_id: OPTIONS_GUMP, hue_z: 1.0, ..Default::default() },
         Interaction::NONE,
         UiNoWindowDrag {},
         UiContainsByBounds {},
