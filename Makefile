@@ -11,7 +11,7 @@ wasm:
 build: wasm
 	mkdir -p $(OUT)
 	cp $(RAW) $(OUT)/mod.wasm
-	printf '{\n  "name": "$(NAME)",\n  "version": "0.1.1",\n  "wasm": "mod.wasm",\n  "ruleset": {}\n}\n' > $(OUT)/mod.json
+	printf '{\n  "name": "$(NAME)",\n  "version": "0.1.2",\n  "wasm": "mod.wasm",\n  "ruleset": {}\n}\n' > $(OUT)/mod.json
 	@echo ">> $(OUT)/mod.wasm"
 
 check:
