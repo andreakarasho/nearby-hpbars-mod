@@ -17,7 +17,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 [[package]]
 name = "cuo-mod-sdk"
 version = "0.4.0"
-source = "git+https://github.com/ClassicUO/classicuo-mods-sdk?rev=8f2adac#8f2adac1f01c0f2d14692612679c1afda198eb41"
+source = "git+https://github.com/ClassicUO/classicuo-mods-sdk?rev=de00483#de004833335a1098d04b129e477df396a459c309"
 dependencies = [
  "cuo-mod-sdk-macros",
  "serde",
@@ -28,7 +28,7 @@ dependencies = [
 [[package]]
 name = "cuo-mod-sdk-macros"
 version = "0.4.0"
-source = "git+https://github.com/ClassicUO/classicuo-mods-sdk?rev=8f2adac#8f2adac1f01c0f2d14692612679c1afda198eb41"
+source = "git+https://github.com/ClassicUO/classicuo-mods-sdk?rev=de00483#de004833335a1098d04b129e477df396a459c309"
 dependencies = [
  "proc-macro2",
  "quote",
