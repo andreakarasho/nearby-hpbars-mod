@@ -3,7 +3,7 @@ exclude = ["external"]
 
 [package]
 name = "cuo-nearby-hpbars"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 
 [dependencies]

@@ -9,6 +9,7 @@ use cuo_mod_sdk::host::Scope;
 use cuo_mod_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const WINDOW: &str = "nearby-hpbars.root";
@@ -49,6 +50,7 @@ fn setup(app: &mut App) {
     app.add_systems(Schedule::Update, update_gump);
     app.add_observer(on_click);
     app.add_observer(configure_action);
+    app.add_observer(on_mobile_removed);
 }
 
 #[derive(Default)]
@@ -65,6 +67,18 @@ struct UiState {
     ticks: u32,
     settings: Option<Settings>,
     status_requests: HashMap<u32, u32>,
+    /// Names / hits / notoriety of known mobiles, fed by `Changed` queries so the
+    /// client only sends what changed instead of every mobile every frame.
+    mobs: HashMap<Entity, MobInfo>,
+    /// The root's last `Node`, fed by a `Changed<Node>` query.
+    root_node: Option<Node>,
+}
+
+#[derive(Default)]
+struct MobInfo {
+    name: Option<String>,
+    hits: Option<Hits>,
+    notoriety: Option<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -134,6 +148,8 @@ static FOLLOW: AtomicU32 = AtomicU32::new(0);
 static RELOAD: AtomicBool = AtomicBool::new(false);
 static OPTIONS_OPEN: AtomicBool = AtomicBool::new(false);
 static COLLAPSE_TOGGLE: AtomicBool = AtomicBool::new(false);
+/// Mobiles despawned since the update system last ran; it evicts them from its cache.
+static REMOVED: Mutex<Vec<Entity>> = Mutex::new(Vec::new());
 
 fn follow_serial() -> u32 {
     FOLLOW.load(Ordering::Relaxed)
@@ -148,16 +164,35 @@ fn update_gump(
     mut state: Local<UiState>,
     mut cmds: Commands,
     player: Query<(&Serial, &WorldPosition), With<Player>>,
-    mobiles: Query<(&Serial, &EntityName, &WorldPosition), With<Mobile>>,
-    hits: Query<&Hits>,
-    notorieties: Query<&Notoriety>,
+    // Unfiltered: walking mobiles move without a change tick on the client.
+    mobiles: Query<(&Serial, &WorldPosition), With<Mobile>>,
+    names: Query<&EntityName, (With<Mobile>, Changed<EntityName>)>,
+    hits: Query<&Hits, (With<Mobile>, Changed<Hits>)>,
+    notorieties: Query<&Notoriety, (With<Mobile>, Changed<Notoriety>)>,
     // UiResizable first: the snapshot is driven by the first term, so this
     // only hands over resizable windows, not every UI node in the client.
-    windows: Query<(&UiResizable, &Node)>,
+    windows: Query<(&UiResizable, &Node), Changed<Node>>,
 ) {
     let state = &mut *state;
     state.ticks = state.ticks.wrapping_add(1);
     let now = state.ticks;
+
+    // Changed rows arrive once, so they are folded in every frame, not only on refresh.
+    for e in REMOVED.lock().unwrap().drain(..) {
+        state.mobs.remove(&e);
+    }
+    for (e, name) in &names {
+        state.mobs.entry(e).or_default().name = Some(name.value.clone());
+    }
+    for (e, h) in &hits {
+        state.mobs.entry(e).or_default().hits = Some(h.clone());
+    }
+    for (e, n) in &notorieties {
+        state.mobs.entry(e).or_default().notoriety = Some(n.value);
+    }
+    if let Some((_, node)) = state.root.and_then(|root| windows.get(root)) {
+        state.root_node = Some(node.clone());
+    }
 
     if RELOAD.swap(false, Ordering::Relaxed) {
         state.settings = None;
@@ -199,13 +234,13 @@ fn update_gump(
         settings.collapsed = !settings.collapsed;
         settings.save();
     }
-    sync_collapse(state, &mut cmds, &windows);
+    sync_collapse(state, &mut cmds);
     sync_options_panel(state, &mut cmds);
     if now % REFRESH_EVERY != 1 {
         return;
     }
 
-    persist_size(state, &windows);
+    persist_size(state);
 
     let Some((_, (player_serial, player_pos))) = player.single() else {
         return;
@@ -217,10 +252,16 @@ fn update_gump(
 
     let mut nearby = Vec::new();
     let mut in_range = HashSet::new();
-    for (mobile_entity, (serial, name, pos)) in &mobiles {
+    for (mobile_entity, (serial, pos)) in &mobiles {
         if serial.value == 0 || serial.value == player_serial.value {
             continue;
         }
+        let Some(info) = state.mobs.get(&mobile_entity) else {
+            continue;
+        };
+        let Some(name) = &info.name else {
+            continue;
+        };
         let distance = pos.x.abs_diff(player_pos.x).max(pos.y.abs_diff(player_pos.y));
         if serial.value == follow {
             follow_seen = true;
@@ -232,8 +273,9 @@ fn update_gump(
             continue;
         }
         in_range.insert(serial.value);
-        let hp = hits
-            .get(mobile_entity)
+        let hp = info
+            .hits
+            .as_ref()
             .and_then(|h| (h.max_value > 0).then_some((h.value, h.max_value)));
         if hp.is_none() {
             let last = state.status_requests.get(&serial.value).copied();
@@ -242,15 +284,13 @@ fn update_gump(
                 state.status_requests.insert(serial.value, now);
             }
         }
-        let notoriety = notorieties
-            .get(mobile_entity)
-            .map_or(notoriety_flag::UNKNOWN, |n| n.value);
+        let notoriety = info.notoriety.unwrap_or(notoriety_flag::UNKNOWN);
         if hidden.contains(&notoriety) {
             continue;
         }
         nearby.push(RowView {
             serial: serial.value,
-            name: name.value.clone(),
+            name: name.clone(),
             hp_pct: hp.map(|(hp, max)| ((u32::from(hp) * 100) / u32::from(max)).min(100)),
             distance,
             notoriety,
@@ -282,7 +322,7 @@ fn update_gump(
 /// Shrinks the window to its header (or restores the saved height) when the
 /// collapsed flag changes. The root's whole `Node` is re-inserted, so its
 /// current position is read back first to keep it where the user dragged it.
-fn sync_collapse(state: &mut UiState, cmds: &mut Commands, windows: &Query<(&UiResizable, &Node)>) {
+fn sync_collapse(state: &mut UiState, cmds: &mut Commands) {
     let settings = state.settings.as_ref().unwrap();
     let collapsed = settings.collapsed;
     if state.collapsed_view == Some(collapsed) {
@@ -291,7 +331,7 @@ fn sync_collapse(state: &mut UiState, cmds: &mut Commands, windows: &Query<(&UiR
     let (Some(root), Some(list), Some(options)) = (state.root, state.list, state.options) else {
         return;
     };
-    let Some((_, node)) = windows.get(root) else {
+    let Some(node) = &state.root_node else {
         return;
     };
     let mut node = node.clone();
@@ -367,14 +407,11 @@ fn sync_options_panel(state: &mut UiState, cmds: &mut Commands) {
     state.panel_view = Some(view);
 }
 
-fn persist_size(state: &mut UiState, windows: &Query<(&UiResizable, &Node)>) {
+fn persist_size(state: &mut UiState) {
     if state.ticks.wrapping_sub(state.toggled_at) < SIZE_SETTLE_FRAMES {
         return;
     }
-    let (Some(root), Some(settings)) = (state.root, state.settings.as_mut()) else {
-        return;
-    };
-    let Some((_, node)) = windows.get(root) else {
+    let (Some(settings), Some(node)) = (state.settings.as_mut(), state.root_node.as_ref()) else {
         return;
     };
     if node.width.type_ != val_type::PX || node.height.type_ != val_type::PX {
@@ -506,6 +543,11 @@ fn follow_color(view: &RowView) -> Color {
 
 fn quick_color(slot: usize) -> Color {
     if slot == 0 { rgb(65, 130, 75) } else { rgb(70, 105, 155) }
+}
+
+#[system]
+fn on_mobile_removed(removed: On<Remove, Mobile>) {
+    REMOVED.lock().unwrap().push(removed.entity());
 }
 
 #[system]

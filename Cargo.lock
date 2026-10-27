@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "cuo-nearby-hpbars"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cuo-mod-sdk",
  "serde",
