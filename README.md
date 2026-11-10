@@ -15,6 +15,10 @@ Current features:
 
 Per-gump color and notoriety filters are not configurable yet. Quick-action selections and window size are saved in the mod's global storage.
 
+## Look
+
+The window is an HTML/CSS page, `src/nearby.html` and `src/nearby.css`. It follows the client's UI theme. The client exports it to `Data/Mods/<mod folder>/ui/`, where an edited copy wins and reloads on save.
+
 ## Build
 
 Requires Rust and the `wasm32-wasip2` target. Cargo fetches the client mod SDK from its pinned Git revision.

@@ -1,0 +1,48 @@
+<!doctype html>
+<!-- The Nearby window (nearby-hpbars-mod). The mod sizes the window (the body fills it) and answers
+     the data-arg of each data-action="mod" element. It adds .collapsed to #frame and labels
+     #collapse, adds .filters to #frame while the notoriety filters are open and .off to the #noto-N
+     of a notoriety it doesn't list. It fills #list from the template, a row per mobile: the name and
+     HP % in [data-part=label], the mobile's notoriety as data-noto on [data-part=name], the distance,
+     .on and "Stop" on the follow button of the mobile being followed, and the two quick actions'
+     names (a right-click on one changes its action). A row it has no mobile for gets .hidden.
+     Drag the bottom-right corner to resize. -->
+<html>
+<head><link rel="stylesheet" href="nearby.css"></head>
+<body data-theme>
+  <template id="row">
+    <div class="row">
+      <button class="name" data-part="name" data-action="mod"><span data-part="label"></span></button>
+      <div class="distance" data-part="distance"></div>
+      <button class="follow" data-part="follow" data-action="mod">Follow</button>
+      <button class="quick" data-part="quick0" data-action="mod" data-rclick="quick:0">Bandage</button>
+      <button class="quick second" data-part="quick1" data-action="mod" data-rclick="quick:1">Heal</button>
+    </div>
+  </template>
+
+  <div id="frame">
+    <div id="header">
+      <button id="collapse" data-action="mod" data-arg="collapse">-</button>
+      <div id="title">Nearby</div>
+      <img id="options" src="gump:0x07D6" data-action="mod" data-arg="options">
+    </div>
+
+    <div id="filters">
+      <div class="filter-row">
+        <button id="noto-0" class="noto" data-noto="0" data-action="mod" data-arg="noto:0">Unknown</button>
+        <button id="noto-1" class="noto" data-noto="1" data-action="mod" data-arg="noto:1">Innocent</button>
+        <button id="noto-2" class="noto" data-noto="2" data-action="mod" data-arg="noto:2">Ally</button>
+        <button id="noto-3" class="noto" data-noto="3" data-action="mod" data-arg="noto:3">Gray</button>
+      </div>
+      <div class="filter-row">
+        <button id="noto-4" class="noto" data-noto="4" data-action="mod" data-arg="noto:4">Criminal</button>
+        <button id="noto-5" class="noto" data-noto="5" data-action="mod" data-arg="noto:5">Enemy</button>
+        <button id="noto-6" class="noto" data-noto="6" data-action="mod" data-arg="noto:6">Murderer</button>
+        <button id="noto-7" class="noto" data-noto="7" data-action="mod" data-arg="noto:7">Invul</button>
+      </div>
+    </div>
+
+    <div id="list"></div>
+  </div>
+</body>
+</html>

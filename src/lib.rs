@@ -1,67 +1,59 @@
 //! Nearby mobile health and quick-action gump for ClassicUO.
 //!
 //! Rows are rebuilt from nearby mobiles with known hit points, sorted by range.
-//! The host owns movement, resizing, hit testing and gump rendering;
-//! this mod supplies ordinary `cuo:ui/*` entities and uses client actions.
+//! The window is an HTML/CSS page (`nearby.html`, `nearby.css`) that takes the
+//! client's theme; this mod sizes it, fills it and answers its clicks.
 
 use cuo_mod_sdk::assets::{self, ImageKind};
-use cuo_mod_sdk::host::Scope;
+use cuo_mod_sdk::host::{PageChange, Scope};
 use cuo_mod_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const WINDOW: &str = "nearby-hpbars.root";
-const ROW_PREFIX: &str = "nearby-hpbars.row.";
+const PAGE_NAME: &str = "nearby";
+const PAGE_HTML: &str = include_str!("nearby.html");
+const PAGE_CSS: &str = include_str!("nearby.css");
 const REFRESH_EVERY: u32 = 5;
 const STATUS_RETRY_FRAMES: u32 = 300;
 const FOLLOW_EVERY: u32 = 30;
 const RANGE: u16 = 18;
-const FONT_SIZE: u16 = 16;
-const ROW_HEIGHT: f32 = 23.0;
+/// The page's header is at least this tall, inside this body padding: the collapsed window's height.
 const HEADER_HEIGHT: f32 = 21.0;
 const PADDING: f32 = 4.0;
 const WINDOW_WIDTH: f32 = 380.0;
 const WINDOW_HEIGHT: f32 = 120.0;
 const MIN_WIDTH: f32 = 200.0;
 const MIN_HEIGHT: f32 = 80.0;
-const ACTION_WIDTH: f32 = 60.0;
-const FOLLOW_WIDTH: f32 = 54.0;
-const DISTANCE_WIDTH: f32 = 28.0;
-const COLLAPSE_WIDTH: f32 = 20.0;
 /// Frames after a collapse toggle during which the window size is not saved,
 /// so the collapsed height never overwrites the user's size.
 const SIZE_SETTLE_FRAMES: u32 = 10;
-/// Any finite z: the host only needs the root to carry one to treat it as a
-/// draggable window, and bumps it to the top on interaction.
-const WINDOW_Z: i32 = 60;
+/// Two clicks on a name closer than this are a double click (the client's own is 300 ms between presses).
+const DOUBLE_CLICK_MS: f32 = 400.0;
+const NOTORIETIES: u8 = 8;
 const ACTIONS: usize = 8;
 const BACKPACK_LAYER: usize = 0x15;
 const MAX_CONTAINER_DEPTH: usize = 8;
-/// TTF text: the host's regular font with its TtfFlag bit.
-const FONT: u16 = 1 | 0x100;
-/// Paperdoll "Options" button art.
+/// Paperdoll "Options" button art, the page's #options.
 const OPTIONS_GUMP: u32 = 0x07D6;
-const NOTORIETY_NAMES: [&str; 8] =
-    ["Unknown", "Innocent", "Ally", "Gray", "Criminal", "Enemy", "Murderer", "Invul"];
 
 fn setup(app: &mut App) {
     app.add_systems(Schedule::Update, update_gump);
-    app.add_observer(on_click);
-    app.add_observer(configure_action);
+    app.add_systems(Schedule::Update, (item_feed.run_on_change(), clicks));
     app.add_observer(on_mobile_removed);
+    app.add_observer(on_item_uncontained);
 }
 
 #[derive(Default)]
 struct UiState {
-    root: Option<Entity>,
-    list: Option<Entity>,
-    options: Option<Entity>,
-    collapse: Option<Entity>,
+    /// The window root.
+    page: Option<u64>,
+    /// The page's #list: a reload of the page replaces it, and the rows are gone with it.
+    list: Option<u64>,
     collapsed_view: Option<bool>,
     toggled_at: u32,
-    panel: Vec<Entity>,
     panel_view: Option<(bool, Vec<u8>)>,
     rows: Vec<RowSlot>,
     ticks: u32,
@@ -129,27 +121,40 @@ struct RowView {
     slots: [usize; 2],
 }
 
-/// One positional row of the list. Rows are reused in place and only the
-/// parts whose view changed get new components, so a moving mobile does not
-/// rebuild (and relayout / re-measure) the whole list.
+/// One positional row of the list: a copy of the page's row template. Rows are
+/// reused in place and only the parts whose view changed are edited, so a moving
+/// mobile does not restyle the whole list. A page has no call to remove one copy,
+/// so a spare row is hidden (`view` none) until the list grows again.
 struct RowSlot {
-    row: Entity,
-    name: Entity,
-    distance: Entity,
-    follow: Entity,
-    quick: [Entity; 2],
-    view: RowView,
+    row: u64,
+    name: u64,
+    label: u64,
+    distance: u64,
+    follow: u64,
+    quick: [u64; 2],
+    view: Option<RowView>,
 }
 
-// State shared between the click observers and the update system. Observers
-// get no `Local` of the system, and the guest is single-threaded, so plain
-// atomics are enough.
+// State shared between the click system and the update system. The guest is
+// single-threaded, so plain atomics are enough.
+/// The open window, 0 = none.
+static PAGE: AtomicU64 = AtomicU64::new(0);
 static FOLLOW: AtomicU32 = AtomicU32::new(0);
 static RELOAD: AtomicBool = AtomicBool::new(false);
 static OPTIONS_OPEN: AtomicBool = AtomicBool::new(false);
 static COLLAPSE_TOGGLE: AtomicBool = AtomicBool::new(false);
 /// Mobiles despawned since the update system last ran; it evicts them from its cache.
 static REMOVED: Mutex<Vec<Entity>> = Mutex::new(Vec::new());
+/// Every item inside a container, by entity: where a click finds a bandage, so
+/// no system has to be sent all of them each frame.
+static CONTAINED: Mutex<Option<HashMap<u64, Contained>>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct Contained {
+    serial: u32,
+    graphic: u16,
+    parent: u64,
+}
 
 fn follow_serial() -> u32 {
     FOLLOW.load(Ordering::Relaxed)
@@ -190,7 +195,7 @@ fn update_gump(
     for (e, n) in &notorieties {
         state.mobs.entry(e).or_default().notoriety = Some(n.value);
     }
-    if let Some((_, node)) = state.root.and_then(|root| windows.get(root)) {
+    if let Some((_, node)) = state.page.and_then(|page| windows.get(Entity::from_bits(page))) {
         state.root_node = Some(node.clone());
     }
 
@@ -210,8 +215,9 @@ fn update_gump(
     // The player entity only exists once the client is in the world: no gump
     // on the login / character screens, and tear it down again on logout.
     if player.single().is_none() {
-        if let Some(root) = state.root {
-            cmds.entity(root).despawn();
+        if let Some(page) = state.page {
+            host::page_close(page);
+            PAGE.store(0, Ordering::Relaxed);
             let ticks = state.ticks;
             let settings = state.settings.take();
             *state = UiState::default();
@@ -220,22 +226,24 @@ fn update_gump(
         }
         return;
     }
-    if state.root.is_none() {
+    if state.page.is_none() {
         let settings = state.settings.as_ref().unwrap();
-        let w = spawn_window(&mut cmds, settings);
-        state.root = Some(w.root);
-        state.options = Some(w.options);
-        state.list = Some(w.list);
-        state.collapse = Some(w.collapse);
+        let Some(page) = open_window(&mut cmds, settings) else {
+            return;
+        };
+        state.page = Some(page);
+        PAGE.store(page, Ordering::Relaxed);
         state.collapsed_view = Some(settings.collapsed);
     }
+    let page = state.page.unwrap();
+    sync_page(state, page, &mut cmds);
     if COLLAPSE_TOGGLE.swap(false, Ordering::Relaxed) {
         let settings = state.settings.as_mut().unwrap();
         settings.collapsed = !settings.collapsed;
         settings.save();
     }
-    sync_collapse(state, &mut cmds);
-    sync_options_panel(state, &mut cmds);
+    sync_collapse(state, page, &mut cmds);
+    sync_filters(state, page);
     if now % REFRESH_EVERY != 1 {
         return;
     }
@@ -304,17 +312,50 @@ fn update_gump(
     state.status_requests.retain(|serial, _| in_range.contains(serial));
     nearby.sort_by(|a, b| a.distance.cmp(&b.distance).then(a.serial.cmp(&b.serial)));
 
-    for slot in state.rows.drain(nearby.len().min(state.rows.len())..) {
-        cmds.entity(slot.row).despawn();
+    if state.list.is_none() {
+        return;
     }
-    let list = state.list.unwrap();
+    for slot in state.rows.iter_mut().skip(nearby.len()) {
+        if slot.view.take().is_some() {
+            host::page_edit_element(page, slot.row, &class(true, "hidden"));
+        }
+    }
     for (i, view) in nearby.into_iter().enumerate() {
-        match state.rows.get_mut(i) {
-            Some(slot) => update_row(&mut cmds, slot, view),
-            None => {
-                let slot = spawn_row(&mut cmds, list, view);
-                state.rows.push(slot);
-            }
+        if i == state.rows.len() {
+            let Some(slot) = clone_row(page, &mut cmds) else {
+                break;
+            };
+            state.rows.push(slot);
+        }
+        update_row(page, &mut state.rows[i], view);
+    }
+}
+
+fn class(on: bool, name: &str) -> PageChange {
+    if on { PageChange::AddClass(name.into()) } else { PageChange::RemoveClass(name.into()) }
+}
+
+/// A button takes its own clicks, anywhere in its box, instead of dragging the window.
+fn no_drag(cmds: &mut Commands, element: u64) {
+    cmds.entity(Entity::from_bits(element)).insert((UiNoWindowDrag {}, UiContainsByBounds {}));
+}
+
+/// The page loaded or reloaded (the player saved its file, or switched theme):
+/// its elements are new and the rows are gone, so they are cloned again.
+fn sync_page(state: &mut UiState, page: u64, cmds: &mut Commands) {
+    let list = host::page_element(page, "list");
+    if list == state.list {
+        return;
+    }
+    state.list = list;
+    state.rows.clear();
+    if list.is_none() {
+        return;
+    }
+    let filters = (0..NOTORIETIES).map(|flag| format!("noto-{flag}"));
+    for id in ["collapse".to_string(), "options".to_string()].into_iter().chain(filters) {
+        if let Some(element) = host::page_element(page, &id) {
+            no_drag(cmds, element);
         }
     }
 }
@@ -322,15 +363,12 @@ fn update_gump(
 /// Shrinks the window to its header (or restores the saved height) when the
 /// collapsed flag changes. The root's whole `Node` is re-inserted, so its
 /// current position is read back first to keep it where the user dragged it.
-fn sync_collapse(state: &mut UiState, cmds: &mut Commands) {
+fn sync_collapse(state: &mut UiState, page: u64, cmds: &mut Commands) {
     let settings = state.settings.as_ref().unwrap();
     let collapsed = settings.collapsed;
     if state.collapsed_view == Some(collapsed) {
         return;
     }
-    let (Some(root), Some(list), Some(options)) = (state.root, state.list, state.options) else {
-        return;
-    };
     let Some(node) = &state.root_node else {
         return;
     };
@@ -338,15 +376,16 @@ fn sync_collapse(state: &mut UiState, cmds: &mut Commands) {
     let (height, min_height) = window_height(settings);
     node.height = Val::px(height);
     node.min_height = Val::px(min_height);
-    cmds.entity(root).insert(node);
-    let display = if collapsed { display::NONE } else { display::FLEX };
-    cmds.entity(list).insert(list_node(display));
-    cmds.entity(options).insert(options_node(display));
-    if let Some(button) = state.collapse {
-        cmds.entity(button).insert(Text { value: collapse_label(collapsed).into() });
-    }
+    cmds.entity(Entity::from_bits(page)).insert(node);
+    show_collapsed(page, collapsed);
     state.collapsed_view = Some(collapsed);
     state.toggled_at = state.ticks;
+}
+
+/// The page hides the list and the filters of a collapsed window.
+fn show_collapsed(page: u64, collapsed: bool) {
+    host::page_edit(page, "frame", &class(collapsed, "collapsed"));
+    host::page_edit(page, "collapse", &PageChange::Text(collapse_label(collapsed).into()));
 }
 
 fn window_height(settings: &Settings) -> (f32, f32) {
@@ -362,47 +401,17 @@ fn collapse_label(collapsed: bool) -> &'static str {
     if collapsed { "+" } else { "-" }
 }
 
-/// Rebuilds the notoriety-filter toggles when the panel opens, closes or a
-/// filter changes.
-fn sync_options_panel(state: &mut UiState, cmds: &mut Commands) {
+/// Shows the notoriety filters while they are open, and which ones are off.
+fn sync_filters(state: &mut UiState, page: u64) {
     let open = OPTIONS_OPEN.load(Ordering::Relaxed);
     let hidden = state.settings.as_ref().unwrap().hidden.clone();
     let view = (open, hidden);
     if state.panel_view.as_ref() == Some(&view) {
         return;
     }
-    for e in state.panel.drain(..) {
-        cmds.entity(e).despawn();
-    }
-    let options = state.options.unwrap();
-    if view.0 {
-        for chunk in 0..2u8 {
-            let row = cmds
-                .spawn((
-                    Node {
-                        flex_direction: flex_direction::ROW,
-                        width: Val::percent(100.0),
-                        height: Val::px(ROW_HEIGHT),
-                        gap: Val::px(2.0),
-                        ..Node::base()
-                    },
-                    ChildOf { parent: options },
-                ))
-                .id();
-            for flag in chunk * 4..chunk * 4 + 4 {
-                let shown = !view.1.contains(&flag);
-                let color = if shown { notoriety_color(flag) } else { rgb(28, 36, 47) };
-                spawn_button(
-                    cmds,
-                    row,
-                    &format!("{ROW_PREFIX}noto:{flag}"),
-                    NOTORIETY_NAMES[flag as usize],
-                    Val::grow(),
-                    color,
-                );
-            }
-            state.panel.push(row);
-        }
+    host::page_edit(page, "frame", &class(view.0, "filters"));
+    for flag in 0..NOTORIETIES {
+        host::page_edit(page, &format!("noto-{flag}"), &class(view.1.contains(&flag), "off"));
     }
     state.panel_view = Some(view);
 }
@@ -430,97 +439,60 @@ fn persist_size(state: &mut UiState) {
     }
 }
 
-fn spawn_row(cmds: &mut Commands, list: Entity, view: RowView) -> RowSlot {
-    let row = cmds
-        .spawn((
-            Node {
-                flex_direction: flex_direction::ROW,
-                align_items: align_items::CENTER,
-                width: Val::percent(100.0),
-                height: Val::px(ROW_HEIGHT),
-                gap: Val::px(3.0),
-                ..Node::base()
-            },
-            ChildOf { parent: list },
-        ))
-        .id();
-    let name = spawn_button(
-        cmds,
-        row,
-        &name_key(&view),
-        &name_text(&view),
-        Val::grow(),
-        notoriety_color(view.notoriety),
-    );
-    let distance = spawn_label(cmds, row, &view.distance.to_string(), DISTANCE_WIDTH);
-    let follow = spawn_button(
-        cmds,
-        row,
-        &follow_key(&view),
-        follow_text(&view),
-        Val::px(FOLLOW_WIDTH),
-        follow_color(&view),
-    );
-    let quick = [0, 1].map(|slot| {
-        spawn_button(
-            cmds,
-            row,
-            &quick_key(&view, slot),
-            action_label(view.slots[slot]),
-            Val::px(ACTION_WIDTH),
-            quick_color(slot),
-        )
-    });
-    RowSlot { row, name, distance, follow, quick, view }
+/// A new copy of the row template at the end of the list.
+fn clone_row(page: u64, cmds: &mut Commands) -> Option<RowSlot> {
+    let row = host::page_clone(page, "list", "row")?;
+    let part = |name: &str| host::page_part(page, row, name);
+    let parts = (|| Some((part("name")?, part("label")?, part("distance")?, part("follow")?, part("quick0")?, part("quick1")?)))();
+    let Some((name, label, distance, follow, quick0, quick1)) = parts else {
+        // An edited page whose row lacks a part: don't pile up a copy per refresh.
+        host::page_clear(page, "list");
+        return None;
+    };
+    for button in [name, follow, quick0, quick1] {
+        no_drag(cmds, button);
+    }
+    Some(RowSlot { row, name, label, distance, follow, quick: [quick0, quick1], view: None })
 }
 
-fn update_row(cmds: &mut Commands, slot: &mut RowSlot, view: RowView) {
-    let old = &slot.view;
-    if *old == view {
+/// Edits the parts of a row whose view changed: all of them on a new or hidden row.
+fn update_row(page: u64, slot: &mut RowSlot, view: RowView) {
+    if slot.view.as_ref() == Some(&view) {
         return;
     }
-    let serial = old.serial != view.serial;
-    if serial || old.name != view.name || old.hp_pct != view.hp_pct || old.following != view.following {
-        cmds.entity(slot.name).insert(Text { value: name_text(&view) });
+    let old = slot.view.take();
+    let changed = |same: &dyn Fn(&RowView) -> bool| !old.as_ref().is_some_and(same);
+    let edit = |element: u64, change: PageChange| host::page_edit_element(page, element, &change);
+    let attr = |element: u64, name: &str, value: String| edit(element, PageChange::Attr((name.into(), value)));
+    if old.is_none() {
+        edit(slot.row, class(false, "hidden"));
     }
-    if serial || old.notoriety != view.notoriety {
-        cmds.entity(slot.name)
-            .insert(BackgroundColor { value: notoriety_color(view.notoriety) });
+    if changed(&|o| o.serial == view.serial) {
+        attr(slot.name, "data-arg", format!("context:{}", view.serial));
+        attr(slot.follow, "data-arg", format!("follow:{}", view.serial));
+        for i in 0..2 {
+            attr(slot.quick[i], "data-arg", format!("quick:{}:{i}", view.serial));
+        }
     }
-    if old.distance != view.distance {
-        cmds.entity(slot.distance).insert(Text { value: view.distance.to_string() });
+    if changed(&|o| name_text(o) == name_text(&view)) {
+        edit(slot.label, PageChange::Text(name_text(&view)));
     }
-    if serial || old.following != view.following {
-        cmds.entity(slot.follow).insert((
-            Text { value: follow_text(&view).into() },
-            BackgroundColor { value: follow_color(&view) },
-        ));
+    if changed(&|o| o.notoriety == view.notoriety) {
+        attr(slot.name, "data-noto", view.notoriety.to_string());
     }
-    if serial {
-        cmds.entity(slot.name).insert(UiName { value: name_key(&view) });
-        cmds.entity(slot.follow).insert(UiName { value: follow_key(&view) });
+    if changed(&|o| o.distance == view.distance) {
+        edit(slot.distance, PageChange::Text(view.distance.to_string()));
+    }
+    if changed(&|o| o.following == view.following) {
+        edit(slot.follow, PageChange::Text(follow_text(&view).into()));
+        edit(slot.follow, class(view.following, "on"));
     }
     for i in 0..2 {
-        if serial {
-            cmds.entity(slot.quick[i]).insert(UiName { value: quick_key(&view, i) });
-        }
-        if old.slots[i] != view.slots[i] {
-            cmds.entity(slot.quick[i]).insert(Text { value: action_label(view.slots[i]).into() });
+        if changed(&|o| o.slots[i] == view.slots[i]) {
+            edit(slot.quick[i], PageChange::Text(action_label(view.slots[i]).into()));
         }
     }
-    slot.view = view;
-}
-
-fn name_key(view: &RowView) -> String {
-    format!("{ROW_PREFIX}context:{}", view.serial)
-}
-
-fn follow_key(view: &RowView) -> String {
-    format!("{ROW_PREFIX}follow:{}", view.serial)
-}
-
-fn quick_key(view: &RowView, slot: usize) -> String {
-    format!("{ROW_PREFIX}quick:{}:{slot}", view.serial)
+    slot.view = Some(view);
 }
 
 fn name_text(view: &RowView) -> String {
@@ -537,161 +509,173 @@ fn follow_text(view: &RowView) -> &'static str {
     if view.following { "Stop" } else { "Follow" }
 }
 
-fn follow_color(view: &RowView) -> Color {
-    if view.following { rgb(47, 191, 174) } else { rgb(38, 48, 61) }
-}
-
-fn quick_color(slot: usize) -> Color {
-    if slot == 0 { rgb(65, 130, 75) } else { rgb(70, 105, 155) }
-}
-
 #[system]
 fn on_mobile_removed(removed: On<Remove, Mobile>) {
     REMOVED.lock().unwrap().push(removed.entity());
 }
 
+/// True when `serial` was also clicked less than `DOUBLE_CLICK_MS` ago. A double click starts over.
+fn is_double_click(last: &mut Option<(u32, f32)>, serial: u32, now: f32) -> bool {
+    let double = last.is_some_and(|(s, at)| s == serial && now - at <= DOUBLE_CLICK_MS);
+    *last = (!double).then_some((serial, now));
+    double
+}
+
+/// Answers the page's clicks: the `data-arg` of each clicked element, and
+/// `rclick:<x>:<y>:quick:<slot>` for a right-click on a quick button.
 #[system]
-fn on_click(
-    click: On<Event, UiClick>,
-    names: Query<&UiName>,
-    mouse: Res<MouseInput>,
+fn clicks(
+    mut last_name_click: Local<Option<(u32, f32)>>,
+    time: Res<Time>,
     targeting: Option<Res<TargetingState>>,
     war_mode: Query<&ServerFlags, With<Player>>,
-    items: Query<(&Serial, &Graphic, &ChildOf)>,
     player: Query<&EquipmentSlots, With<Player>>,
 ) {
-    let Some(name) = names.get(click.entity()) else {
+    let page = PAGE.load(Ordering::Relaxed);
+    if page == 0 {
         return;
-    };
-    let Some(data) = name.value.strip_prefix(ROW_PREFIX) else {
-        return;
-    };
-    let Some((kind, tail)) = data.split_once(':') else {
-        return;
-    };
-    let mut parts = tail.split(':');
-    let Some(Ok(serial)) = parts.next().map(str::parse::<u32>) else {
-        return;
-    };
-    match kind {
-        "context" => {
-            if targeting.as_ref().is_some_and(|t| t.is_targeting) {
-                actions::target_object(serial);
-                return;
-            }
-            let in_war = war_mode
-                .single()
-                .is_some_and(|(_, flags)| flags.value & flags::WAR_MODE != 0);
-            if in_war {
-                // A single click must not open the menu, or the double-click
-                // that attacks would land on the popup.
-                if mouse.left_double {
-                    actions::attack(serial);
+    }
+    for click in host::page_clicks(page) {
+        let mut parts = click.split(':');
+        let kind = parts.next().unwrap_or_default();
+        let mut number = || parts.next().and_then(|part| part.parse::<u32>().ok());
+        match kind {
+            "context" => {
+                let Some(serial) = number() else {
+                    continue;
+                };
+                if targeting.as_ref().is_some_and(|t| t.is_targeting) {
+                    actions::target_object(serial);
+                    continue;
                 }
-                return;
-            }
-            actions::request_context_menu(serial);
-        }
-        "collapse" => {
-            COLLAPSE_TOGGLE.store(true, Ordering::Relaxed);
-        }
-        "options" => {
-            OPTIONS_OPEN.fetch_xor(true, Ordering::Relaxed);
-        }
-        "noto" => {
-            let Ok(flag) = u8::try_from(serial) else {
-                return;
-            };
-            let mut settings = cuo_mod_sdk::storage::load::<Settings>(Scope::Global)
-                .unwrap_or_else(Settings::new);
-            if let Some(i) = settings.hidden.iter().position(|&h| h == flag) {
-                settings.hidden.remove(i);
-            } else {
-                settings.hidden.push(flag);
-            }
-            settings.save();
-            RELOAD.store(true, Ordering::Relaxed);
-        }
-        "follow" => {
-            if follow_serial() == serial {
-                set_follow(0);
-                actions::cancel_walk_to();
-            } else {
-                set_follow(serial);
-            }
-        }
-        "quick" => {
-            let Some(Ok(slot)) = parts.next().map(str::parse::<usize>) else {
-                return;
-            };
-            let settings = cuo_mod_sdk::storage::load::<Settings>(Scope::Global)
-                .unwrap_or_else(Settings::new);
-            let mode = settings.slots.get(slot).copied().unwrap_or(slot) % ACTIONS;
-            if mode == 0 {
-                if let Some(bandage) = find_bandage(&items, &player) {
-                    actions::use_item_on(bandage, serial);
+                let in_war = war_mode
+                    .single()
+                    .is_some_and(|(_, flags)| flags.value & flags::WAR_MODE != 0);
+                if in_war {
+                    // A single click must not open the menu, or the double-click
+                    // that attacks would land on the popup.
+                    if is_double_click(&mut last_name_click, serial, time.total) {
+                        actions::attack(serial);
+                    }
+                    continue;
                 }
-            } else if let Some(spell) = spell_id(mode) {
-                actions::cast_spell(spell);
-                actions::target_object(serial);
+                actions::request_context_menu(serial);
             }
+            "collapse" => {
+                COLLAPSE_TOGGLE.store(true, Ordering::Relaxed);
+            }
+            "options" => {
+                OPTIONS_OPEN.fetch_xor(true, Ordering::Relaxed);
+            }
+            "noto" => {
+                let Some(flag) = number().and_then(|flag| u8::try_from(flag).ok()) else {
+                    continue;
+                };
+                let mut settings = cuo_mod_sdk::storage::load::<Settings>(Scope::Global)
+                    .unwrap_or_else(Settings::new);
+                if let Some(i) = settings.hidden.iter().position(|&h| h == flag) {
+                    settings.hidden.remove(i);
+                } else {
+                    settings.hidden.push(flag);
+                }
+                settings.save();
+                RELOAD.store(true, Ordering::Relaxed);
+            }
+            "follow" => {
+                let Some(serial) = number() else {
+                    continue;
+                };
+                if follow_serial() == serial {
+                    set_follow(0);
+                    actions::cancel_walk_to();
+                } else {
+                    set_follow(serial);
+                }
+            }
+            "quick" => {
+                let (Some(serial), Some(slot)) = (number(), number()) else {
+                    continue;
+                };
+                let slot = slot as usize;
+                let settings = cuo_mod_sdk::storage::load::<Settings>(Scope::Global)
+                    .unwrap_or_else(Settings::new);
+                let mode = settings.slots.get(slot).copied().unwrap_or(slot) % ACTIONS;
+                if mode == 0 {
+                    if let Some(bandage) = find_bandage(&player) {
+                        actions::use_item_on(bandage, serial);
+                    }
+                } else if let Some(spell) = spell_id(mode) {
+                    actions::cast_spell(spell);
+                    actions::target_object(serial);
+                }
+            }
+            "rclick" => {
+                let Some(Ok(slot)) = click.rsplit(':').next().map(str::parse::<usize>) else {
+                    continue;
+                };
+                let mut settings = cuo_mod_sdk::storage::load::<Settings>(Scope::Global)
+                    .unwrap_or_else(Settings::new);
+                let Some(mode) = settings.slots.get_mut(slot) else {
+                    continue;
+                };
+                *mode = (*mode + 1) % ACTIONS;
+                settings.save();
+                // The update system reloads settings and relabels the rows.
+                RELOAD.store(true, Ordering::Relaxed);
+            }
+            _ => {}
         }
-        _ => {}
+    }
+}
+
+/// Keeps `CONTAINED` in step: an item entering a container or changing container
+/// (its first sight counts), and a contained item changing graphic. Leaving is
+/// `on_item_uncontained`.
+#[system]
+fn item_feed(
+    moved: Query<(&Serial, &Graphic, &ChildOf), (With<ContainedInto>, Changed<ChildOf>)>,
+    regraphed: Query<(&Serial, &Graphic, &ChildOf), (With<ContainedInto>, Changed<Graphic>)>,
+) {
+    let mut contained = CONTAINED.lock().unwrap();
+    let contained = contained.get_or_insert_with(HashMap::new);
+    for (entity, (serial, graphic, child)) in moved.iter().chain(regraphed.iter()) {
+        let item = Contained { serial: serial.value, graphic: graphic.value, parent: child.parent.to_bits() };
+        contained.insert(entity.to_bits(), item);
+    }
+}
+
+/// A contained item left its container (dropped, equipped, used up) or the client.
+/// Every contained item has a slot position and nothing else does: a `ChildOf`
+/// removal would also fire for every UI node the client despawns.
+#[system]
+fn on_item_uncontained(gone: On<Remove, ContainerSlotPosition>) {
+    if let Some(contained) = CONTAINED.lock().unwrap().as_mut() {
+        contained.remove(&gone.entity().to_bits());
     }
 }
 
 /// A bandage anywhere inside the backpack, including nested bags.
-fn find_bandage(
-    items: &Query<(&Serial, &Graphic, &ChildOf)>,
-    player: &Query<&EquipmentSlots, With<Player>>,
-) -> Option<u32> {
+fn find_bandage(player: &Query<&EquipmentSlots, With<Player>>) -> Option<u32> {
     let (_, equipment) = player.single()?;
     let backpack = *equipment.serials.get(BACKPACK_LAYER)?;
     let backpack = host::resolve_serial(backpack)?;
-    let parents: HashMap<u64, u64> = items
-        .iter()
-        .map(|(entity, (_, _, child))| (entity.to_bits(), child.parent.to_bits()))
-        .collect();
-    items.iter().find_map(|(entity, (serial, graphic, _))| {
-        if graphic.value != helpers::BANDAGE {
+    bandage_in(CONTAINED.lock().unwrap().as_ref()?, backpack)
+}
+
+fn bandage_in(contained: &HashMap<u64, Contained>, backpack: u64) -> Option<u32> {
+    contained.values().find_map(|item| {
+        if item.graphic != helpers::BANDAGE {
             return None;
         }
-        let mut current = entity.to_bits();
+        let mut parent = item.parent;
         for _ in 0..MAX_CONTAINER_DEPTH {
-            let parent = *parents.get(&current)?;
             if parent == backpack {
-                return Some(serial.value);
+                return Some(item.serial);
             }
-            current = parent;
+            parent = contained.get(&parent)?.parent;
         }
         None
     })
-}
-
-#[system]
-fn configure_action(click: On<Event, UiRightClick>, names: Query<&UiName>) {
-    let Some(name) = names.get(click.entity()) else {
-        return;
-    };
-    let Some(tail) = name
-        .value
-        .strip_prefix(ROW_PREFIX)
-        .and_then(|data| data.strip_prefix("quick:"))
-    else {
-        return;
-    };
-    let Some(Ok(slot)) = tail.split(':').nth(1).map(str::parse::<usize>) else {
-        return;
-    };
-    let mut settings = cuo_mod_sdk::storage::load::<Settings>(Scope::Global)
-        .unwrap_or_else(Settings::new);
-    let Some(mode) = settings.slots.get_mut(slot) else {
-        return;
-    };
-    *mode = (*mode + 1) % ACTIONS;
-    settings.save();
-    // The update system reloads settings and rebuilds rows with the new label.
-    RELOAD.store(true, Ordering::Relaxed);
 }
 
 fn action_label(mode: usize) -> &'static str {
@@ -711,13 +695,6 @@ fn spell_id(mode: usize) -> Option<u16> {
     }
 }
 
-struct Window {
-    root: Entity,
-    options: Entity,
-    list: Entity,
-    collapse: Entity,
-}
-
 /// The header is at least as tall as the options art.
 fn header_height() -> f32 {
     options_art_size().1.max(HEADER_HEIGHT)
@@ -730,175 +707,66 @@ fn options_art_size() -> (f32, f32) {
         .unwrap_or((60.0, 22.0))
 }
 
-fn list_node(display: u8) -> Node {
-    Node {
-        flex_direction: flex_direction::COLUMN,
-        width: Val::percent(100.0),
-        height: Val::grow(),
-        gap: Val::px(2.0),
-        overflow: overflow::SCROLL,
-        display,
-        ..Node::base()
-    }
-}
-
-fn options_node(display: u8) -> Node {
-    Node {
-        flex_direction: flex_direction::COLUMN,
-        width: Val::percent(100.0),
-        gap: Val::px(2.0),
-        display,
-        ..Node::base()
-    }
-}
-
-fn spawn_window(cmds: &mut Commands, settings: &Settings) -> Window {
+/// Opens the window where it always starts, at its saved size.
+fn open_window(cmds: &mut Commands, settings: &Settings) -> Option<u64> {
+    let page = host::page_spawn(PAGE_NAME, PAGE_HTML, PAGE_CSS, 30, 150)?;
     let (height, min_height) = window_height(settings);
-    let display = if settings.collapsed { display::NONE } else { display::FLEX };
-    let root = cmds
-        .spawn((
-            Node {
-                flex_direction: flex_direction::COLUMN,
-                min_width: Val::px(MIN_WIDTH),
-                min_height: Val::px(min_height),
-                padding: UiRect::splat(Val::px(PADDING)),
-                border: UiRect::splat(Val::px(1.0)),
-                gap: Val::px(2.0),
-                overflow: overflow::CLIP,
-                ..Node::abs(30.0, 150.0, settings.width, height)
-            },
-            UiName { value: WINDOW.into() },
-            UiMovable {},
-            GlobalZIndex { value: WINDOW_Z },
-            UiResizable {
-                min_w: MIN_WIDTH,
-                min_h: MIN_HEIGHT,
-                max_w: 900.0,
-                max_h: 700.0,
-                grip: 10.0,
-                grip_inset: 0.0,
-                whole_pixels: true,
-            },
-            UiNoRightClickClose {},
-            UiContainsByBounds {},
-            BackgroundColor { value: Color::rgba(13, 17, 23, 247) },
-            BorderColor { r: 52.0, g: 61.0, b: 74.0, a: 255.0 },
-            BorderRadius::all(8.0),
-        ))
-        .id();
-    let (bw, bh) = options_art_size();
-    let header = cmds
-        .spawn((
-            Node {
-                flex_direction: flex_direction::ROW,
-                align_items: align_items::CENTER,
-                width: Val::percent(100.0),
-                height: Val::px(header_height()),
-                gap: Val::px(4.0),
-                ..Node::base()
-            },
-            ChildOf { parent: root },
-        ))
-        .id();
-    let collapse = spawn_button(
-        cmds,
-        header,
-        &format!("{ROW_PREFIX}collapse:0"),
-        collapse_label(settings.collapsed),
-        Val::px(COLLAPSE_WIDTH),
-        rgb(38, 48, 61),
-    );
-    cmds.spawn((
+    cmds.entity(Entity::from_bits(page)).insert((
         Node {
-            width: Val::grow(),
-            height: Val::px(HEADER_HEIGHT),
-            overflow: overflow::CLIP,
-            ..Node::base()
+            display: display::FLEX,
+            min_width: Val::px(MIN_WIDTH),
+            min_height: Val::px(min_height),
+            ..Node::abs(30.0, 150.0, settings.width, height)
         },
-        Text { value: "Nearby".into() },
-        TextFont { font_id: FONT, size: FONT_SIZE },
-        TextColor { value: rgb(214, 221, 228) },
-        ChildOf { parent: header },
-    ));
-    cmds.spawn((
-        Node { width: Val::px(bw), height: Val::px(bh), ..Node::base() },
-        UiCustom { kind: 0, asset_id: OPTIONS_GUMP, hue_z: 1.0, ..Default::default() },
-        Interaction::NONE,
-        UiNoWindowDrag {},
+        UiName { value: WINDOW.into() },
+        UiResizable {
+            min_w: MIN_WIDTH,
+            min_h: MIN_HEIGHT,
+            max_w: 900.0,
+            max_h: 700.0,
+            grip: 10.0,
+            grip_inset: 0.0,
+            whole_pixels: true,
+        },
+        UiNoRightClickClose {},
         UiContainsByBounds {},
-        UiName { value: format!("{ROW_PREFIX}options:0") },
-        ChildOf { parent: header },
     ));
-    let options = cmds.spawn((options_node(display), ChildOf { parent: root })).id();
-    let list = cmds
-        .spawn((list_node(display), ScrollPosition::default(), ChildOf { parent: root }))
-        .id();
-    Window { root, options, list, collapse }
+    show_collapsed(page, settings.collapsed);
+    Some(page)
 }
 
-fn spawn_label(cmds: &mut Commands, parent: Entity, text: &str, width: f32) -> Entity {
-    cmds.spawn((
-        Node {
-            width: Val::px(width),
-            height: Val::px(ROW_HEIGHT - 2.0),
-            justify_content: justify_content::CENTER,
-            align_items: align_items::CENTER,
-            ..Node::base()
-        },
-        Text { value: text.into() },
-        TextFont { font_id: FONT, size: FONT_SIZE },
-        TextColor { value: Color::rgb(214, 221, 228) },
-        ChildOf { parent },
-    ))
-    .id()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn spawn_button(
-    cmds: &mut Commands,
-    parent: Entity,
-    name: &str,
-    text: &str,
-    width: Val,
-    color: Color,
-) -> Entity {
-    cmds.spawn((
-        Node {
-            width,
-            height: Val::px(ROW_HEIGHT - 2.0),
-            justify_content: justify_content::CENTER,
-            align_items: align_items::CENTER,
-            overflow: overflow::CLIP,
-            ..Node::base()
-        },
-        BackgroundColor { value: color },
-        BorderRadius::all(2.0),
-        Text { value: text.into() },
-        TextFont { font_id: FONT, size: FONT_SIZE },
-        TextColor { value: Color::rgb(245, 245, 245) },
-        Interaction::NONE,
-        UiNoWindowDrag {},
-        UiContainsByBounds {},
-        UiName { value: name.into() },
-        ChildOf { parent },
-    ))
-    .id()
-}
-
-fn notoriety_color(notoriety: u8) -> Color {
-    match notoriety {
-        notoriety_flag::INNOCENT => rgb(57, 112, 190),
-        notoriety_flag::ALLY => rgb(54, 155, 84),
-        notoriety_flag::GRAY => rgb(150, 150, 150),
-        notoriety_flag::CRIMINAL => rgb(190, 165, 55),
-        notoriety_flag::ENEMY => rgb(190, 95, 45),
-        notoriety_flag::MURDERER => rgb(185, 55, 55),
-        notoriety_flag::INVULNERABLE => rgb(140, 80, 170),
-        _ => rgb(80, 80, 80),
+    #[test]
+    fn a_bandage_is_found_in_the_backpack_and_its_bags_only() {
+        let item = |serial, graphic, parent| Contained { serial, graphic, parent };
+        let (backpack, bag, inner, bank) = (1, 2, 3, 9);
+        let mut contained = HashMap::from([
+            (bag, item(20, 0x0E75, backpack)),
+            (inner, item(30, 0x0E75, bag)),
+            (10, item(100, 0x0F0E, backpack)),
+            (11, item(110, helpers::BANDAGE, bank)),
+        ]);
+        assert_eq!(bandage_in(&contained, backpack), None, "another container's bandage");
+        contained.insert(12, item(120, helpers::BANDAGE, inner));
+        assert_eq!(bandage_in(&contained, backpack), Some(120), "two bags deep");
+        contained.remove(&12);
+        assert_eq!(bandage_in(&contained, backpack), None, "it left its container");
+        contained.insert(13, item(130, helpers::BANDAGE, 77));
+        assert_eq!(bandage_in(&contained, backpack), None, "a parent nobody knows");
     }
-}
 
-fn rgb(r: u8, g: u8, b: u8) -> Color {
-    Color::rgb(r, g, b)
+    #[test]
+    fn a_second_click_on_the_same_name_in_time_is_a_double_click() {
+        let mut last = None;
+        assert!(!is_double_click(&mut last, 7, 1000.0));
+        assert!(!is_double_click(&mut last, 8, 1100.0), "another mobile");
+        assert!(is_double_click(&mut last, 8, 1300.0));
+        assert!(!is_double_click(&mut last, 8, 1400.0), "the third click starts over");
+        assert!(!is_double_click(&mut last, 8, 1400.0 + DOUBLE_CLICK_MS + 1.0), "too late");
+    }
 }
 
 export_mod!(setup);

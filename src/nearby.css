@@ -1,0 +1,52 @@
+/* The Nearby window (nearby-hpbars-mod fills it, see nearby.html). It takes the client's theme
+   (<body data-theme>): the window, #collapse and the follow buttons are the theme's, the rest is
+   here. Everything here is yours to change.
+   The mod counts on one size: a collapsed window is as tall as #header (the options art, at least
+   21px) plus the body's 4px padding above and below. */
+
+body { margin: 0; padding: 4px; width: 100%; height: 100%; font-size: 16px }
+button { display: flex; justify-content: center; align-items: center; flex-shrink: 0; height: 21px; padding: 0; font-size: 16px }
+
+#frame { display: flex; flex-direction: column; gap: 2px; width: 100%; height: 100%; overflow: hidden }
+
+#header { display: flex; align-items: center; flex-shrink: 0; gap: 4px; min-height: 21px }
+#collapse { width: 20px }
+#title { flex-grow: 1; min-width: 0; height: 21px; overflow: hidden }
+#options { flex-shrink: 0 }
+
+/* Flat, in a colour that says something, whatever the theme's button is. */
+.name, .name:hover, .noto, .noto:hover, .quick, .quick:hover { background-image: none; border: none; border-radius: 2px; color: rgb(245, 245, 245) }
+
+/* A notoriety's colour: a mobile's name, and its filter. */
+.name, .noto { flex-grow: 1; flex-basis: 0; min-width: 0; overflow: hidden; background-color: rgb(80, 80, 80) }
+[data-noto="1"] { background-color: rgb(57, 112, 190) }
+[data-noto="2"] { background-color: rgb(54, 155, 84) }
+[data-noto="3"] { background-color: rgb(150, 150, 150) }
+[data-noto="4"] { background-color: rgb(190, 165, 55) }
+[data-noto="5"] { background-color: rgb(190, 95, 45) }
+[data-noto="6"] { background-color: rgb(185, 55, 55) }
+[data-noto="7"] { background-color: rgb(140, 80, 170) }
+
+/* Shown while .filters is on #frame. A filter that is .off hides its mobiles. */
+#filters { display: none; flex-direction: column; flex-shrink: 0; gap: 2px }
+#frame.filters #filters { display: flex }
+.filter-row { display: flex; flex-shrink: 0; gap: 2px; height: 23px }
+.noto.off, .noto.off:hover { background-color: var(--theme-panel, rgb(28, 36, 47)) }
+
+#list {
+  display: flex; flex-direction: column; flex-grow: 1; min-height: 0; gap: 2px;
+  overflow-y: scroll; scrollbar-color: var(--theme-border, rgb(58, 67, 80)) transparent; scrollbar-width: 8px;
+}
+#frame.collapsed #filters, #frame.collapsed #list { display: none }
+
+.row { display: flex; align-items: center; flex-shrink: 0; gap: 3px; height: 23px }
+.row.hidden { display: none }
+/* One line, cut at the button's edges. */
+.name span { flex-shrink: 0; white-space: nowrap }
+.distance { display: flex; justify-content: center; align-items: center; flex-shrink: 0; width: 28px; height: 21px }
+.follow { width: 54px }
+/* A flat fill instead of the theme's button: the mobile being followed. */
+.follow.on, .follow.on:hover { background-image: none; background-color: var(--theme-accent, rgb(47, 191, 174)); color: rgb(4, 35, 31) }
+/* The first and the second quick action. */
+.quick { width: 60px; background-color: rgb(65, 130, 75) }
+.quick.second { background-color: rgb(70, 105, 155) }
