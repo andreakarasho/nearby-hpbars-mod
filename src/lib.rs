@@ -391,7 +391,7 @@ fn sync_options_panel(state: &mut UiState, cmds: &mut Commands) {
                 .id();
             for flag in chunk * 4..chunk * 4 + 4 {
                 let shown = !view.1.contains(&flag);
-                let color = if shown { notoriety_color(flag) } else { rgb(40, 40, 46) };
+                let color = if shown { notoriety_color(flag) } else { rgb(28, 36, 47) };
                 spawn_button(
                     cmds,
                     row,
@@ -538,7 +538,7 @@ fn follow_text(view: &RowView) -> &'static str {
 }
 
 fn follow_color(view: &RowView) -> Color {
-    if view.following { rgb(150, 110, 40) } else { rgb(70, 70, 80) }
+    if view.following { rgb(47, 191, 174) } else { rgb(38, 48, 61) }
 }
 
 fn quick_color(slot: usize) -> Color {
@@ -762,6 +762,7 @@ fn spawn_window(cmds: &mut Commands, settings: &Settings) -> Window {
                 min_width: Val::px(MIN_WIDTH),
                 min_height: Val::px(min_height),
                 padding: UiRect::splat(Val::px(PADDING)),
+                border: UiRect::splat(Val::px(1.0)),
                 gap: Val::px(2.0),
                 overflow: overflow::CLIP,
                 ..Node::abs(30.0, 150.0, settings.width, height)
@@ -780,8 +781,9 @@ fn spawn_window(cmds: &mut Commands, settings: &Settings) -> Window {
             },
             UiNoRightClickClose {},
             UiContainsByBounds {},
-            BackgroundColor { value: rgb(18, 22, 29) },
-            BorderRadius::all(3.0),
+            BackgroundColor { value: Color::rgba(13, 17, 23, 247) },
+            BorderColor { r: 52.0, g: 61.0, b: 74.0, a: 255.0 },
+            BorderRadius::all(8.0),
         ))
         .id();
     let (bw, bh) = options_art_size();
@@ -804,7 +806,7 @@ fn spawn_window(cmds: &mut Commands, settings: &Settings) -> Window {
         &format!("{ROW_PREFIX}collapse:0"),
         collapse_label(settings.collapsed),
         Val::px(COLLAPSE_WIDTH),
-        rgb(55, 60, 72),
+        rgb(38, 48, 61),
     );
     cmds.spawn((
         Node {
@@ -815,7 +817,7 @@ fn spawn_window(cmds: &mut Commands, settings: &Settings) -> Window {
         },
         Text { value: "Nearby".into() },
         TextFont { font_id: FONT, size: FONT_SIZE },
-        TextColor { value: rgb(205, 205, 205) },
+        TextColor { value: rgb(214, 221, 228) },
         ChildOf { parent: header },
     ));
     cmds.spawn((
@@ -845,7 +847,7 @@ fn spawn_label(cmds: &mut Commands, parent: Entity, text: &str, width: f32) -> E
         },
         Text { value: text.into() },
         TextFont { font_id: FONT, size: FONT_SIZE },
-        TextColor { value: Color::rgb(205, 205, 205) },
+        TextColor { value: Color::rgb(214, 221, 228) },
         ChildOf { parent },
     ))
     .id()
